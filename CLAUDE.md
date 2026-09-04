@@ -63,15 +63,39 @@ Installed plugins:
   cannot execute. `resolve()` tries `.cmd`/`.exe`/`.bat` first. Same trap applies
   to any Node CLI shim.
 
+### Console encoding on Windows
+
+`claude` prints `✔`/`✘` in ordinary success output, not just in `Status:` lines.
+Python on Windows gives stdout the **cp1252** locale encoding whenever it is not
+a console — a pipe, a redirect, a scheduled-task log — and cp1252 cannot encode
+those glyphs. Printing one raised `UnicodeEncodeError` and killed the run partway
+through the marketplace stage, *after* npm had already committed its changes.
+
+`configure_stdio()` reconfigures stdout/stderr to UTF-8 with `errors="replace"`
+before any stage runs, and `log()` catches `UnicodeEncodeError` as a fallback.
+Do not remove either: `GLYPH_RE` only sanitises parsed status text, so it does
+not protect the many other places CLI output is echoed verbatim.
+
+### Verified: "already at the latest version"
+
+Confirmed against Claude Code 2.1.260 — exit code **0**, output verbatim:
+
+```
+Checking for updates for plugin "superpowers@claude-plugins-official" at user scope…
+✔ superpowers is already at the latest version (6.3.0).
+```
+
+So `classify()`'s loose `"already"` + `"latest"` match is correct. Note the name
+in the message is the **bare** plugin name (`superpowers`), not the
+`name@marketplace` form passed on the command line — don't tighten the match to
+expect the full form.
+
 ### Not yet verified
 
-- The exact "already at the latest version" string from `claude plugin update`.
-  `classify()` matches `"already"` and `"latest"` loosely; anything unrecognised
-  is reported verbatim as changed rather than swallowed.
 - The orphan path (`Plugin.is_orphan`, `--prune-orphans`). No orphaned plugin was
   present to test against. It keys off `"failed to load"` in the status line.
 
-If you verify either, update this section with what the CLI actually printed.
+If you verify it, update this section with what the CLI actually printed.
 
 ## Working style in this repo
 

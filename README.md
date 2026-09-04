@@ -87,6 +87,10 @@ Things that cost debugging time, so you don't repeat them:
   corrupt the JSON.
 - **On Windows, `shutil.which("npm")` finds `npm.ps1`**, which `CreateProcess`
   cannot execute. `resolve()` prefers `.cmd`/`.exe`/`.bat` shims.
+- **Windows gives Python a cp1252 stdout whenever output is piped or redirected**,
+  and cp1252 cannot encode the `✔`/`✘` the CLI prints in normal success output.
+  Unfixed, that aborts the run mid-stage — after npm has already made changes.
+  `configure_stdio()` forces UTF-8 with `errors="replace"` before anything runs.
 - Updates run sequentially. With 60+ plugins that takes minutes, hence the
   `[ n/total]` progress counter.
 
@@ -99,10 +103,15 @@ On Windows 10 / Python 3.14.2, against Claude Code 2.1.246 with 62 plugins:
   statuses (50 enabled, 12 disabled) all correct.
 - Failure path — a bogus plugin name is correctly classified as failed.
 
-Not yet exercised on a live run: the "already at the latest" detection string and
-the orphan-pruning path (no orphaned plugins were installed to test against).
-Both degrade safely — an unrecognized message is reported verbatim rather than
-being silently swallowed.
+A full live run against Claude Code 2.1.260 then confirmed the rest: all four
+npm globals updated, 4 marketplaces refreshed, 62 plugins processed (1 changed,
+61 already current, 0 failed) and the Cursor extension updated. The
+already-at-latest message is verbatim `✔ <name> is already at the latest version
+(<v>).` at exit 0, which `classify()` reads correctly.
+
+Still not exercised: the orphan-pruning path (no orphaned plugins were installed
+to test against). It degrades safely — an unrecognized message is reported
+verbatim rather than being silently swallowed.
 
 ## License
 

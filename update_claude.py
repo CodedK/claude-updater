@@ -105,8 +105,28 @@ def run(argv: Sequence[str], timeout: int = 900, merge_stderr: bool = True) -> R
     return Result(proc.returncode, ANSI_RE.sub("", text).strip())
 
 
+def configure_stdio() -> None:
+    """Make stdout/stderr survive the non-ASCII glyphs the CLI prints.
+
+    Windows falls back to cp1252 for these streams whenever they are not a
+    console - a pipe, a redirect, a scheduled-task log. cp1252 cannot encode
+    the check/cross marks `claude` emits, so printing one raises
+    UnicodeEncodeError and aborts the run mid-stage.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass  # exotic stream - log() degrades gracefully below
+
+
 def log(message: str = "") -> None:
-    print(message, flush=True)
+    try:
+        print(message, flush=True)
+    except UnicodeEncodeError:
+        # Belt-and-braces: configure_stdio() could not reconfigure this stream.
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(message.encode(encoding, "replace").decode(encoding), flush=True)
 
 
 def heading(title: str) -> None:
@@ -368,6 +388,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    configure_stdio()
     skip = frozenset(args.skip)
 
     log("Claude toolchain updater")
