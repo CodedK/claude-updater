@@ -97,6 +97,45 @@ expect the full form.
 
 If you verify it, update this section with what the CLI actually printed.
 
+## After EVERY update run: report the breaking changes
+
+A version bump is not a report. Any time `update_claude.py` actually changes
+something, fetch the real changelog for every component that moved and say what
+**breaks**. Do this unprompted, every run.
+
+Go straight to these sources - do not search for them:
+
+| Component | Where the notes actually live |
+|---|---|
+| `@anthropic-ai/claude-code` | `raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md` - complete, `## <version>` headings, covers every patch |
+| `@openai/codex` | GitHub **releases**: `gh api repos/openai/codex/releases`. Tags are `rust-v<ver>`; skip every `-alpha.*`. Its `CHANGELOG.md` is a 93-byte stub pointing here. |
+| `claude-flow` | `gh api repos/ruvnet/claude-flow/releases/tags/v<ver>` |
+| `@nanonets/graft` | Repo is **NanoNets/context-graph-engine** (not `nanonets/graft`). No releases, tags only - use `gh api .../compare/v<old>...v<new>` |
+
+Method:
+
+1. `awk` the changelog between the new version and the old one - not the whole file.
+2. Grep that range for `breaking|no longer|removed|renamed|deprecat|now requires|must now|changed the default`.
+3. **Verify each survivor against this machine.** Read `~/.claude/settings.json`,
+   its permission rules, its `env` block. A change is only "breaking" if the
+   config here actually trips it. Say "checked N rules, 0 affected" - a verified
+   negative is a real result and is worth more than a vague warning.
+4. Split the report into **BITES YOU** and **SAFE / FYI**. Never bury a live
+   problem in a feature list.
+
+When testing a permission rule for the "text after the closing parenthesis"
+break, the test is `starts with Tool(` **and does not end with `)`**. A greedy
+`^Tool\(.*\)\s*\S+` backtracks across escaped `\)` inside quoted commands and
+flags dozens of perfectly valid rules.
+
+### Voice: caveman with a PhD
+
+One line per change. Blunt short words, exact technical content. Verdict first,
+mechanism second. No hedging, no paragraphs, no filler.
+
+> Planning tool now sleep. `update_plan` is opt-in since codex 0.152.0 - set
+> `tools.update_plan.enabled = true` or the model plans in its head.
+
 ## Working style in this repo
 
 - **One file, standard library only.** No dependencies, no packaging, no `src/`
