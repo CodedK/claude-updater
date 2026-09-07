@@ -39,6 +39,16 @@ Installed plugins:
   them so `Plugin.status` is plain text.
 - `Scope:` is per-plugin and must be passed back via `--scope`. Real installs mix
   scopes — the reference machine had 61 `user` and 1 `local`.
+- **The glyphs are host-dependent.** Under a PowerShell host on a legacy code
+  page the CLI transliterates them: the bullet becomes ASCII `>`, and `✔`/`✘`
+  become `√`/`×`. `PLUGIN_NAME_RE` and `GLYPH_RE` accept both sets. Do not
+  "clean up" either pattern down to one alphabet.
+- **`Status:` has four known values**: `enabled`, `disabled`, `failed to load`,
+  and `loaded` — the last belongs to plugins loaded from a directory.
+- **`Path:` appears only on plugins with no marketplace behind them.** Verified
+  on a 62-plugin install: exactly one entry carried it. That makes it the
+  structural signal for `Plugin.is_unmanaged`, which is far more reliable than
+  matching the marketplace suffix.
 
 ### `claude plugin update` behaviour
 
@@ -52,6 +62,12 @@ Installed plugins:
 - `--yes` is deliberately **opt-in, not the default**: auto-accepting a changed
   install command runs whatever the marketplace now declares, unreviewed. Do not
   "simplify" this by always passing `-y`.
+- **Three of its failures are not retryable**, and telling the operator to
+  re-run with `--yes` is wrong for all of them. `classify()` separates them:
+  - deleted upstream → `Plugin "<name>" not found` → `orphan`
+  - loaded off disk → `... with no marketplace backing — it cannot be updated.`
+    → `unmanaged`
+  - anything else → `failed`, the only bucket where `--yes` may help.
 
 ### npm
 
@@ -62,6 +78,16 @@ Installed plugins:
 - On Windows, `shutil.which("npm")` returns `npm.ps1`, which `CreateProcess`
   cannot execute. `resolve()` tries `.cmd`/`.exe`/`.bat` first. Same trap applies
   to any Node CLI shim.
+- **Install one package per call, never a batch.** `npm install -g a@latest
+  b@latest` is a single transaction: if any package fails to build, *none* of
+  them move. Observed for real — `@nanonets/graft` bundles `tree-sitter-kotlin`,
+  a native addon whose `node-gyp` step needs Visual Studio with the "Desktop
+  development with C++" workload, and its failure silently held `@openai/codex`
+  22 releases behind while npm reported only peer-dependency warnings.
+- **Report the tail of an npm failure, not the head.** `summarize()` takes the
+  first 160 characters, which for npm is all `npm warn ERESOLVE` noise; the
+  actual `gyp ERR! stack ...` cause is at the end. That is what
+  `summarize_failure()` is for.
 
 ### Console encoding on Windows
 
@@ -75,6 +101,59 @@ through the marketplace stage, *after* npm had already committed its changes.
 before any stage runs, and `log()` catches `UnicodeEncodeError` as a fallback.
 Do not remove either: `GLYPH_RE` only sanitises parsed status text, so it does
 not protect the many other places CLI output is echoed verbatim.
+
+### Finding the CLI
+
+- **A native install is not on PATH.** The installer puts the binary in
+  `~/.local/bin` and does not necessarily add that directory to PATH, so
+  `shutil.which("claude")` finds nothing while a working CLI sits right there.
+  `find_claude()` falls back to `NATIVE_CLAUDE_DIRS` for exactly this.
+- When the CLI genuinely cannot be found, that is **recorded as a problem**, not
+  a silent skip. Before, `main()` dropped `market` and `plugins` from the stage
+  list and still printed "all stages completed cleanly" — the tool's headline
+  result was a lie on any machine with a native install.
+- A native install is **not updated by any of the four stages**; it updates
+  itself via `claude update`. Only an npm-installed CLI moves in the `npm` stage.
+
+### Scope, and where plugins actually live
+
+- **`~/.claude/plugins/installed_plugins.json` is the registry.** Schema
+  `{"version": 2, "plugins": {"name@marketplace": [ {scope, projectPath,
+  installPath, version, installedAt, ...} ]}}`. A project's
+  `.claude/settings.json` `enabledPlugins` map is a *separate* thing — it holds
+  enable/disable state, not installation. Removing an entry from one does not
+  remove it from the other.
+- **`--scope project` is resolved against the process's cwd**, matched to the
+  `projectPath` in that registry. `claude plugin list` shows project-scoped
+  plugins belonging to *other* projects, so the tool routinely lists plugins it
+  cannot uninstall from where it is running. `--prune-orphans` can therefore
+  only prune a project-scoped orphan when run from that plugin's own project.
+- **A drive-letter case mismatch makes an entry unremovable.** One entry on the
+  reference machine recorded `projectPath` as `c:\Users\...` while Windows
+  reports the cwd as `C:\Users\...`. The comparison never matches, so:
+  - `--scope project` → `is not installed in project scope`
+  - `--scope user` / `--scope local` → `is enabled at project scope`
+
+  Every scope refuses it. The only repair is deleting the key from
+  `installed_plugins.json`. Do not add a workaround for this to the tool — it is
+  a CLI bug, and hand-editing its registry is not something a bulk updater
+  should do unattended.
+- `claude plugin uninstall` **exits 1 on failure** and prints the reason. Log
+  that reason: "FAILED" on its own tells you nothing, and a refused uninstall is
+  almost always about scope.
+- **Hand-editing a project's `enabledPlugins` does not stick.** A running Claude
+  Code session rewrites `.claude/settings.json` and restores the key, leaving no
+  git diff to show for it. `installed_plugins.json` is the source of truth: once
+  the entry is gone from there, `claude plugin list` stops showing the plugin
+  even though the stale `false` flag reappears in settings.json. That leftover
+  flag is inert - it disables a plugin that is no longer installed.
+
+### Marketplaces can partially fail
+
+`claude plugin marketplace update` exits **1** when *any* marketplace fails,
+printing e.g. `1 marketplace could not be refreshed (see --debug): ruflo
+✘ Updated 3 marketplaces, but not all`. The others really were updated, so this
+is a warning about one source, not a dead stage.
 
 ### Verified: "already at the latest version"
 
@@ -90,12 +169,24 @@ in the message is the **bare** plugin name (`superpowers`), not the
 `name@marketplace` form passed on the command line — don't tighten the match to
 expect the full form.
 
-### Not yet verified
+### Verified: the orphan path
 
-- The orphan path (`Plugin.is_orphan`, `--prune-orphans`). No orphaned plugin was
-  present to test against. It keys off `"failed to load"` in the status line.
+Exercised for real against a 62-plugin install, and it found a hole:
 
-If you verify it, update this section with what the CLI actually printed.
+- **The orphan path fired**, and revealed that `Plugin.is_orphan` alone is not
+  enough. `autofix-bot@claude-plugins-official` was deleted upstream and showed
+  `Status: ✘ failed to load`, so the status check caught it. But
+  `ruflo-wasm@ruflo` was *also* deleted upstream and showed `Status: ✘ disabled`
+  — a disabled plugin reports `disabled` whatever happened to it, hiding the
+  orphan. Orphans are therefore collected from two sources: the status line, and
+  a `not found` verdict from the update attempt.
+
+Still not verified:
+
+- `--dry-run` cannot predict an update-time orphan. It only knows the status
+  line, so it plans an update for a plugin like `ruflo-wasm` and lists no
+  uninstall for it. This is inherent — dry run does not run updates — and is
+  fine, but do not "fix" it by making dry run mutate anything.
 
 ## After EVERY update run: report the breaking changes
 
@@ -128,6 +219,34 @@ break, the test is `starts with Tool(` **and does not end with `)`**. A greedy
 `^Tool\(.*\)\s*\S+` backtracks across escaped `\)` inside quoted commands and
 flags dozens of perfectly valid rules.
 
+### Pitch: one line per change, ELI15
+
+The operator wants to know **what they got**, not that a number moved. Every
+version that moved gets **one line** explaining what it does for them, in plain
+words a bright fifteen-year-old would follow.
+
+- `> ruflo-core@ruflo: 0.1.0 -> 0.2.6` is not a report. What arrived *in* 0.2.6
+  is the report. The version is the citation, not the finding.
+- Order by what they will actually notice: the CLI first, then anything that
+  changes daily behaviour, then the long tail.
+- Collapse the long tail. Twenty plugins that moved for the same reason are one
+  line, not twenty.
+- Say plainly when nothing happened. "47 plugins already current" is a complete
+  answer in one line.
+- **Never invent a changelog.** If you cannot establish what a version changed,
+  say it moved and that you did not verify the contents. An invented feature
+  list is worse than a bare version number, because the operator cannot tell
+  the two apart.
+
+**A moved version does not mean changed code.** Every plugin in a marketplace
+shares that repo's commit SHA as its version, so one commit anywhere bumps all
+of them. Verified 2026-09-07: ten official plugins reported
+`0120fb83da5d -> 85cce0381e78` and were **byte-identical** apart from Claude
+Code's own `.in_use` / `.orphaned_at` bookkeeping. Both trees stay in
+`~/.claude/plugins/cache/<marketplace>/<plugin>/<sha>/`, so
+`diff -rq -x .in_use -x .orphaned_at <old> <new>` settles it offline, with no
+changelog and no guessing. Report churn as churn.
+
 ### Voice: caveman with a PhD
 
 One line per change. Blunt short words, exact technical content. Verdict first,
@@ -135,6 +254,7 @@ mechanism second. No hedging, no paragraphs, no filler.
 
 > Planning tool now sleep. `update_plan` is opt-in since codex 0.152.0 - set
 > `tools.update_plan.enabled = true` or the model plans in its head.
+
 
 ## Working style in this repo
 
