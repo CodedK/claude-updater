@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Sequence
 
 IS_WINDOWS = os.name == "nt"
@@ -54,11 +55,17 @@ PLUGIN_NAME_RE = re.compile(r"^\s*[❯>]\s*(\S+)\s*$")
 VERSION_RE = re.compile(r"^\s*Version:\s*(\S+)")
 SCOPE_RE = re.compile(r"^\s*Scope:\s*(\S+)")
 STATUS_RE = re.compile(r"^\s*Status:\s*(.+?)\s*$")
-# Decorative check/cross/chevron glyphs the CLI mixes into status text.
-GLYPH_RE = re.compile(r"[✔✘❯]")
+# Only a plugin loaded straight off disk (a skills directory) reports a Path.
+PATH_RE = re.compile(r"^\s*Path:\s*(\S.*?)\s*$")
+# Decorative check/cross/chevron glyphs the CLI mixes into status text. A
+# PowerShell host on a legacy code page transliterates them to "√" and "×".
+GLYPH_RE = re.compile(r"[✔✘❯√×]")
 
 # Windows shims Python can spawn directly; .ps1 is not executable via CreateProcess.
 WINDOWS_EXTS: tuple[str, ...] = (".cmd", ".exe", ".bat")
+
+# The native installer drops the CLI here and does not always put it on PATH.
+NATIVE_CLAUDE_DIRS: tuple[Path, ...] = (Path.home() / ".local" / "bin",)
 
 
 # --------------------------------------------------------------------------
@@ -83,6 +90,24 @@ def resolve(program: str) -> str | None:
             if found:
                 return found
     return shutil.which(program)
+
+
+def find_claude() -> str | None:
+    """Locate the Claude CLI: PATH first, then the native installer's directory.
+
+    A native install sits outside PATH on plenty of machines. Without this
+    fallback the marketplace and plugin stages silently do nothing.
+    """
+    found = resolve("claude")
+    if found:
+        return found
+    names = ("claude.exe", "claude.cmd", "claude.bat") if IS_WINDOWS else ("claude",)
+    for directory in NATIVE_CLAUDE_DIRS:
+        for name in names:
+            candidate = directory / name
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+    return None
 
 
 def run(argv: Sequence[str], timeout: int = 900, merge_stderr: bool = True) -> Result:
@@ -140,6 +165,15 @@ def summarize(output: str, limit: int = 160) -> str:
     return flat[:limit] + ("..." if len(flat) > limit else "") or "(no output)"
 
 
+def summarize_failure(output: str, limit: int = 400) -> str:
+    """Like summarize, but keeps the tail - build tools print the cause last."""
+    lines = [line for line in output.splitlines() if line.strip()]
+    flat = " ".join(" ".join(lines[-12:]).split())
+    if not flat:
+        return "(no output)"
+    return ("..." + flat[-limit:]) if len(flat) > limit else flat
+
+
 # --------------------------------------------------------------------------
 # plugin model
 # --------------------------------------------------------------------------
@@ -150,11 +184,22 @@ class Plugin:
     version: str = "?"
     scope: str = "user"
     status: str = "unknown"
+    path: str = ""
 
     @property
     def is_orphan(self) -> bool:
-        """Upstream deleted it from its marketplace - no update can repair it."""
+        """Upstream deleted it from its marketplace - no update can repair it.
+
+        This only catches an orphan that still tries to load. A disabled plugin
+        reports "disabled" whatever happened upstream, so the update attempt in
+        stage_plugins is the other half of the check.
+        """
         return "failed to load" in self.status.lower()
+
+    @property
+    def is_unmanaged(self) -> bool:
+        """Loaded straight from a directory, with no marketplace behind it."""
+        return bool(self.path)
 
 
 def parse_plugins(listing: str) -> tuple[Plugin, ...]:
@@ -183,6 +228,10 @@ def parse_plugins(listing: str) -> tuple[Plugin, ...]:
         if status_match:
             clean = GLYPH_RE.sub("", status_match.group(1)).strip()
             current = replace(current, status=clean)
+            continue
+        path_match = PATH_RE.match(line)
+        if path_match:
+            current = replace(current, path=path_match.group(1))
 
     if current is not None:
         plugins.append(current)
@@ -190,9 +239,17 @@ def parse_plugins(listing: str) -> tuple[Plugin, ...]:
 
 
 def classify(result: Result) -> str:
-    """Bucket one `claude plugin update` run: failed / current / changed."""
+    """Bucket one `claude plugin update` run.
+
+    orphan and unmanaged are failures no re-run can fix, so they are kept apart
+    from the failures where retrying (or --yes) is worth suggesting.
+    """
     text = result.output.lower()
     if not result.ok or "failed to update" in text:
+        if "no marketplace backing" in text:
+            return "unmanaged"
+        if "not found" in text:
+            return "orphan"
         return "failed"
     if "already" in text and "latest" in text:
         return "current"
@@ -240,20 +297,28 @@ def stage_npm(packages: Sequence[str], dry_run: bool) -> list[str]:
     for pkg in targets:
         log(f"* {pkg} (current {present[pkg]})")
     if dry_run:
-        log(f"DRY RUN: npm install -g {' '.join(t + '@latest' for t in targets)}")
+        for pkg in targets:
+            log(f"DRY RUN: npm install -g {pkg}@latest")
         return []
 
-    result = run([npm, "install", "-g", *(f"{t}@latest" for t in targets)], timeout=1800)
+    # One package per call. Batched into a single install, a package that cannot
+    # build - native addons wanting a C++ toolchain - aborts the whole
+    # transaction and silently holds every other package at its old version.
+    failures: dict[str, str] = {}
+    for pkg in targets:
+        result = run([npm, "install", "-g", f"{pkg}@latest"], timeout=1800)
+        if not result.ok:
+            failures[pkg] = summarize_failure(result.output)
+
     after = installed_globals(npm)
     for pkg in targets:
         before, now = present[pkg], after.get(pkg, "?")
         marker = "=" if before == now else ">"
         log(f"  {marker} {pkg}: {before} -> {now}")
+        if pkg in failures:
+            log(f"    ! {failures[pkg]}")
 
-    if not result.ok:
-        log(f"! npm exited {result.code}: {summarize(result.output)}")
-        return [f"npm exit {result.code}"]
-    return []
+    return [f"npm install failed: {pkg}" for pkg in failures]
 
 
 def stage_marketplaces(claude: str, dry_run: bool) -> list[str]:
@@ -280,22 +345,47 @@ def stage_plugins(
     log(f"discovered {total} plugin(s)")
     if dry_run:
         for plugin in plugins:
+            if plugin.is_unmanaged:
+                log(f"DRY RUN: skip {plugin.name} - loaded from {plugin.path},"
+                    " no marketplace to update from")
+                continue
             extra = " --yes" if assume_yes else ""
             log(f"DRY RUN: claude plugin update {plugin.name}"
                 f" --scope {plugin.scope}{extra}  (at {plugin.version})")
+        if prune_orphans:
+            for plugin in plugins:
+                if plugin.is_orphan:
+                    log(f"DRY RUN: claude plugin uninstall {plugin.name}"
+                        f" --scope {plugin.scope}")
         return []
 
-    changed, current, failed = [], 0, []
+    changed, current, failed, unmanaged = [], 0, [], []
+    pruned_failures: list[str] = []
+    # Status-line orphans announce themselves up front. The rest only show up
+    # when their update comes back "not found", so both sources feed this dict.
+    orphans: dict[str, Plugin] = {p.name: p for p in plugins if p.is_orphan}
+
     for index, plugin in enumerate(plugins, start=1):
+        counter = f"[{index:>3}/{total}]"
+        if plugin.is_unmanaged:
+            unmanaged.append(plugin.name)
+            log(f"  - {counter} {plugin.name}: no marketplace backing, skipped")
+            continue
+
         command = [claude, "plugin", "update", plugin.name, "--scope", plugin.scope]
         if assume_yes:
             command.append("--yes")
         result = run(command, timeout=600)
         text = summarize(result.output)
-        counter = f"[{index:>3}/{total}]"
         verdict = classify(result)
 
-        if verdict == "failed":
+        if verdict == "orphan":
+            orphans[plugin.name] = plugin
+            log(f"  x {counter} {plugin.name}: gone from its marketplace")
+        elif verdict == "unmanaged":
+            unmanaged.append(plugin.name)
+            log(f"  - {counter} {plugin.name}: no marketplace backing, skipped")
+        elif verdict == "failed":
             failed.append(plugin.name)
             log(f"  ! {counter} {plugin.name}: {text}")
         elif verdict == "current":
@@ -305,27 +395,41 @@ def stage_plugins(
             changed.append(plugin.name)
             log(f"  > {counter} {plugin.name}: {text}")
 
-    log(f"changed {len(changed)}, already current {current}, failed {len(failed)}")
+    log(f"changed {len(changed)}, already current {current},"
+        f" orphaned {len(orphans)}, unmanaged {len(unmanaged)},"
+        f" failed {len(failed)}")
 
-    orphans = tuple(p for p in parse_plugins(run([claude, "plugin", "list"]).output)
-                    if p.is_orphan)
     if orphans:
         log()
         log(f"{len(orphans)} orphaned plugin(s) - deleted from their marketplace:")
-        for plugin in orphans:
+        for plugin in orphans.values():
             log(f"  x {plugin.name}")
         if prune_orphans:
-            for plugin in orphans:
+            for plugin in orphans.values():
                 result = run(
                     [claude, "plugin", "uninstall", plugin.name,
                      "--scope", plugin.scope],
                     timeout=300,
                 )
-                log(f"  {'removed' if result.ok else 'FAILED'} {plugin.name}")
+                if result.ok:
+                    log(f"  removed {plugin.name}")
+                else:
+                    # Never just say FAILED. A refused uninstall is usually a
+                    # scope problem, and the reason is the only way to tell.
+                    pruned_failures.append(plugin.name)
+                    log(f"  FAILED  {plugin.name}: {summarize(result.output)}")
         else:
             log("  (re-run with --prune-orphans to uninstall them)")
 
-    return [f"plugin update failed: {name}" for name in failed]
+    if unmanaged:
+        log()
+        log(f"{len(unmanaged)} plugin(s) with no marketplace behind them:")
+        for name in unmanaged:
+            log(f"  - {name}")
+        log("  Nothing to update against - edit or delete the directory by hand.")
+
+    return ([f"plugin update failed: {name}" for name in failed]
+            + [f"orphan uninstall failed: {name}" for name in pruned_failures])
 
 
 def stage_extensions(dry_run: bool) -> list[str]:
@@ -396,15 +500,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.dry_run:
         log("DRY RUN - nothing will be modified")
 
-    claude = resolve("claude")
+    problems: list[str] = []
+    claude = find_claude()
     needs_claude = bool({"market", "plugins"} - skip)
     if claude is None and needs_claude:
         log()
-        log("! 'claude' not on PATH - skipping marketplace and plugin stages.")
-        log("  Install with: npm install -g @anthropic-ai/claude-code")
+        log("! Claude CLI not found - skipping marketplace and plugin stages.")
+        log("  Searched PATH and: "
+            + ", ".join(str(d) for d in NATIVE_CLAUDE_DIRS))
+        log("  Native install: run `claude update`, or add its directory to PATH.")
+        log("  npm install:    npm install -g @anthropic-ai/claude-code")
         skip = skip | {"market", "plugins"}
-
-    problems: list[str] = []
+        # A stage that never ran is not a stage that passed.
+        problems.append("claude CLI not found - marketplace and plugin stages skipped")
     if "npm" not in skip:
         problems += stage_npm(tuple(NPM_PACKAGES) + tuple(args.add_npm), args.dry_run)
     if "market" not in skip and claude:
