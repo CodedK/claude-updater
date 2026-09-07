@@ -23,3 +23,9 @@ desktop.ini
 .env
 *.env
 !*.env.template
+
+# Ambient tooling that writes into the cwd (claude-flow/ruflo runtime state)
+.claude-flow/
+
+# Ambient tooling that writes into the cwd (claude-flow/ruflo runtime state)
+.claude-flow/
