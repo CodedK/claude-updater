@@ -3,13 +3,16 @@
 
 Stages, in dependency order:
   1. npm    - global packages (Claude Code CLI + adjacent tooling)
-  2. market - plugin marketplaces (refresh catalogs first, so plugin
+  2. tools  - CLIs that ship outside npm and update themselves (agy)
+  3. market - plugin marketplaces (refresh catalogs first, so plugin
               updates resolve against current sources)
-  3. plugins- every installed plugin, discovered dynamically, per-scope
-  4. ext    - the Claude Code extension in VS Code / Cursor / Windsurf
+  4. plugins- every installed plugin, discovered dynamically, per-scope
+  5. ext    - the Claude Code extension in VS Code / Cursor / Windsurf
+  6. agents - health-check the codex/agy delegation targets, last, so the
+              doctor inspects the toolchain this run just produced
 
-Nothing is hardcoded to one machine: plugins and editors are discovered at
-runtime, and npm packages are only touched if already installed globally.
+Nothing is hardcoded to one machine: plugins, editors and the doctor script
+are discovered at runtime, and packages are only touched if already installed.
 
 Usage:
     python update_claude.py                     # update everything
@@ -18,6 +21,7 @@ Usage:
     python update_claude.py --prune-orphans     # also uninstall dead plugins
     python update_claude.py --skip npm ext      # run a subset of stages
     python update_claude.py --add-npm foo bar   # also update extra globals
+    python update_claude.py --fix-agents        # let the doctor repair codex
 """
 
 from __future__ import annotations
@@ -43,10 +47,34 @@ NPM_PACKAGES: tuple[str, ...] = (
     "@nanonets/graft",
 )
 
+# CLIs that ship outside npm and carry their own updater, as (binary, update
+# argv). Only run when already installed - we never install new tools.
+#
+# agy is a winget package (Google.AntigravityCLI) but must NOT be updated
+# through winget. Measured 2026-09-18: winget installs it as a *Portable*
+# package, which it tracks by file hash. `agy update` rewrites that exe in
+# place, so winget then refuses to touch it -
+#   "Unable to remove Portable package as it has been modified"
+# - and its recorded version freezes (winget said 1.1.8 while agy.exe said
+# 1.2.6). `winget upgrade --force` would push past that check, but winget's
+# manifest lags the vendor's own release feed, so forcing risks silently
+# DOWNGRADING a self-updated binary. The vendor's updater is the only safe path.
+SELF_UPDATING_TOOLS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("agy", ("update",)),
+)
+
+# Health check for the delegation targets. Optional and Windows-only, so its
+# absence is a skipped line, never a recorded problem.
+AGENT_DOCTOR_NAME = "agy-codex-doctor.ps1"
+AGENT_SCRIPT_DIRS: tuple[Path, ...] = (
+    Path.home() / ".claude" / "scripts",
+    Path.home() / ".claude" / "handoff",
+)
+
 EDITOR_COMMANDS: tuple[str, ...] = ("code", "code-insiders", "cursor", "windsurf")
 EXTENSION_ID = "anthropic.claude-code"
 
-STAGES: tuple[str, ...] = ("npm", "market", "plugins", "ext")
+STAGES: tuple[str, ...] = ("npm", "tools", "market", "plugins", "ext", "agents")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -60,6 +88,14 @@ PATH_RE = re.compile(r"^\s*Path:\s*(\S.*?)\s*$")
 # Decorative check/cross/chevron glyphs the CLI mixes into status text. A
 # PowerShell host on a legacy code page transliterates them to "√" and "×".
 GLYPH_RE = re.compile(r"[✔✘❯√×]")
+
+# `--version` answers vary: a bare "1.2.6" from agy, "codex-cli 0.155.0" from
+# codex. Pull the dotted number out rather than trusting the whole line.
+TOOL_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
+
+# Printed where a version should be when the binary will not answer. Not "?",
+# which reads like a cosmetic gap; this is a failed check and says so.
+UNREADABLE = "unreadable"
 
 # Windows shims Python can spawn directly; .ps1 is not executable via CreateProcess.
 WINDOWS_EXTS: tuple[str, ...] = (".cmd", ".exe", ".bat")
@@ -321,6 +357,79 @@ def stage_npm(packages: Sequence[str], dry_run: bool) -> list[str]:
     return [f"npm install failed: {pkg}" for pkg in failures]
 
 
+def tool_version(binary: str) -> str | None:
+    """Ask an already-resolved tool its own version.
+
+    The binary is the only trustworthy source. A package manager records what
+    it installed and never hears about a tool that later updates itself, so its
+    table can disagree with reality indefinitely.
+    """
+    result = run([binary, "--version"], timeout=120)
+    if not result.ok:
+        return None
+    match = TOOL_VERSION_RE.search(result.output)
+    return match.group(0) if match else None
+
+
+def stage_tools(tools: Sequence[tuple[str, tuple[str, ...]]],
+                dry_run: bool) -> list[str]:
+    heading("self-updating CLIs")
+
+    # (name, resolved path, update argv, version before or None if unreadable)
+    targets: list[tuple[str, str, tuple[str, ...], str | None]] = []
+    for binary, update_args in tools:
+        found = resolve(binary)
+        if found is None:
+            log(f"- {binary}: not installed, skipping")
+            continue
+        version = tool_version(found)
+        targets.append((binary, found, update_args, version))
+        log(f"* {binary} (current {version or UNREADABLE})")
+
+    if not targets:
+        log("nothing to update")
+        return []
+
+    if dry_run:
+        for binary, _, update_args, _ in targets:
+            log(f"DRY RUN: {binary} {' '.join(update_args)}")
+        return []
+
+    failures: dict[str, str] = {}
+    for binary, found, update_args, _ in targets:
+        result = run([found, *update_args], timeout=1800)
+        if not result.ok:
+            failures[binary] = summarize_failure(result.output)
+
+    # Re-ask the binary rather than trusting the updater's own summary: a tool
+    # that failed to replace itself still prints a cheerful line about trying.
+    unreadable: list[str] = []
+    for binary, found, _, before in targets:
+        now = tool_version(found)
+        if now is None:
+            # Never print "=" or ">" here. Those are this tool's words for
+            # "already current" and "it moved", and a binary that will not
+            # state its version has told us neither. An in-place self-update
+            # that leaves the exe unrunnable lands exactly here, and reporting
+            # it as a clean upgrade would be the lie CLAUDE.md legislates
+            # against: a stage that never verified is not a stage that passed.
+            unreadable.append(binary)
+            log(f"  ! {binary}: {before or UNREADABLE} -> {UNREADABLE}")
+        else:
+            marker = "=" if before == now else ">"
+            log(f"  {marker} {binary}: {before or UNREADABLE} -> {now}")
+        if binary in failures:
+            log(f"    ! {failures[binary]}")
+
+    return (
+        [f"self-update failed: {binary}" for binary in failures]
+        # Only when the updater itself claimed success - otherwise the failure
+        # above already says it, and one fault should not count twice.
+        + [f"version unreadable after update: {binary}"
+           for binary in unreadable if binary not in failures]
+    )
+
+
 def stage_marketplaces(claude: str, dry_run: bool) -> list[str]:
     heading("plugin marketplaces")
     if dry_run:
@@ -467,6 +576,107 @@ def stage_extensions(dry_run: bool) -> list[str]:
     return problems
 
 
+def verdict_lines(output: str) -> list[str]:
+    """Trim the doctor's report to its verdicts plus the advice that matters.
+
+    The doctor prints `[ OK ] / [ WARN ] / [ BLOCK ]` verdicts, each optionally
+    followed by "." commentary lines carrying the fix. Only an `[ OK ]` verdict
+    has nothing worth saying underneath, so only its commentary is dropped.
+    A section heading resets the state, so notes printed before any verdict -
+    which is how the doctor reports whether it is running elevated - survive.
+    """
+    kept: list[str] = []
+    under_ok = False
+    for raw in output.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("==="):
+            under_ok = False
+        elif stripped.startswith("["):
+            under_ok = stripped.startswith("[ OK ]")
+        elif stripped.startswith(".") and under_ok:
+            continue
+        kept.append(line)
+    return kept
+
+
+def find_agent_doctor() -> Path | None:
+    for directory in AGENT_SCRIPT_DIRS:
+        candidate = directory / AGENT_DOCTOR_NAME
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def stage_agents(dry_run: bool, fix: bool) -> list[str]:
+    """Run the codex/agy doctor, if this machine has one.
+
+    Deliberately last: it reports on the toolchain the earlier stages just
+    produced. An update that leaves codex unable to start is worth hearing
+    about in the same run that shipped it.
+    """
+    heading("delegation agents (codex / agy)")
+    if not IS_WINDOWS:
+        log("- doctor is Windows-only PowerShell - skipping")
+        return []
+
+    doctor = find_agent_doctor()
+    if doctor is None:
+        searched = ", ".join(str(d) for d in AGENT_SCRIPT_DIRS)
+        log(f"- {AGENT_DOCTOR_NAME} not found in {searched} - skipping")
+        return []
+
+    shell = resolve("pwsh") or resolve("powershell")
+    if shell is None:
+        log("- neither pwsh nor powershell on PATH - skipping")
+        return []
+
+    command = [shell, "-NoProfile", "-File", str(doctor)]
+    if fix:
+        command.append("-Fix")
+    if dry_run:
+        log(f"DRY RUN: {' '.join(command)}")
+        return []
+
+    log(f"* {doctor}")
+    result = run(command, timeout=600)
+
+    # The doctor already warns when it is running elevated - where its sandbox
+    # verdict is a false negative - so that rule lives in one place, not two.
+    #
+    # Its "." lines are commentary on the verdict line above them, and that
+    # commentary is where the remediation lives. Filtering them by exit code
+    # deletes exactly the advice worth keeping: the doctor exits
+    # `[int]($blockers -gt 0)`, so a [ WARN ] *only ever* occurs at exit 0.
+    # Every warning's fix was being dropped. Commentary is therefore judged by
+    # the verdict above it, not by the exit code: only [ OK ] earns silence.
+    for line in verdict_lines(result.output):
+        log(f"  {line}")
+
+    if result.code == 124:  # run() timed out; output holds no verdict at all
+        return ["codex/agy doctor timed out"]
+    if result.code in (126, 127):  # run()'s own codes: never launched
+        return [f"codex/agy doctor could not be launched (exit {result.code})"]
+    if result.ok:
+        return []
+
+    # A refused script exits 1 - byte-identical to the doctor's own blocker
+    # code - so the exit code alone cannot tell "codex is broken" from
+    # "PowerShell would not run the file". Saying the wrong one sends the
+    # operator to debug the wrong machine. Deliberately NOT fixed by passing
+    # -ExecutionPolicy Bypass: that overrides a security control the operator
+    # configured, which is not a bulk updater's call to make.
+    lowered = result.output.lower()
+    if "running scripts is disabled" in lowered or "not digitally signed" in lowered:
+        return ["codex/agy doctor blocked by PowerShell execution policy - it "
+                "never ran, so codex/agy are unverified, not broken"]
+    if "=== Summary ===" not in result.output:
+        return ["codex/agy doctor exited before finishing - codex/agy unverified"]
+    return ["codex/agy doctor reported blocker(s)"]
+
+
 # --------------------------------------------------------------------------
 # entry point
 # --------------------------------------------------------------------------
@@ -487,6 +697,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         metavar="STAGE", help=f"stages to skip: {', '.join(STAGES)}")
     parser.add_argument("--add-npm", nargs="+", default=[], metavar="PKG",
                         help="extra global npm packages to update if present")
+    parser.add_argument("--fix-agents", action="store_true",
+                        help="let the codex/agy doctor repair what it finds, "
+                             "rebuilding the Codex sandbox directory if its "
+                             "permissions block non-elevated runs")
     return parser.parse_args(argv)
 
 
@@ -515,6 +729,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         problems.append("claude CLI not found - marketplace and plugin stages skipped")
     if "npm" not in skip:
         problems += stage_npm(tuple(NPM_PACKAGES) + tuple(args.add_npm), args.dry_run)
+    if "tools" not in skip:
+        problems += stage_tools(SELF_UPDATING_TOOLS, args.dry_run)
     if "market" not in skip and claude:
         problems += stage_marketplaces(claude, args.dry_run)
     if "plugins" not in skip and claude:
@@ -523,6 +739,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if "ext" not in skip:
         problems += stage_extensions(args.dry_run)
+    if "agents" not in skip:
+        problems += stage_agents(args.dry_run, args.fix_agents)
 
     heading("summary")
     if problems:
