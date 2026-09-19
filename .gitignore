@@ -27,5 +27,17 @@ desktop.ini
 # Ambient tooling that writes into the cwd (claude-flow/ruflo runtime state)
 .claude-flow/
 
-# Ambient tooling that writes into the cwd (claude-flow/ruflo runtime state)
-.claude-flow/
+# graft: `graft init` writes per-machine wiring for Claude Code, Cursor and
+# Gemini into the repo root - hardcoded absolute paths, plus an `npx -y` MCP
+# server that would run for anyone who clones. Not for a zero-dependency repo.
+# Regenerable any time with `graft init` / `graft build`.
+/graft/
+/.ignore
+/.mcp.json
+/AGENTS.md
+/GEMINI.md
+/.claude/settings.json
+/.claude/helpers/graft-*.cjs
+/.claude/skills/graft/
+/.cursor/
+/.gemini/
