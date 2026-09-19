@@ -541,34 +541,67 @@ def stage_plugins(
             + [f"orphan uninstall failed: {name}" for name in pruned_failures])
 
 
-def stage_extensions(dry_run: bool) -> list[str]:
+def version_key(version: str) -> tuple[int, ...]:
+    """Numeric sort key for a dotted version; () when there is no number."""
+    match = TOOL_VERSION_RE.search(version)
+    return tuple(int(part) for part in match.group(0).split(".")) if match else ()
+
+
+def installed_extension(editor: str) -> str | None:
+    """Version of the Claude Code extension in one editor, or None if absent."""
+    listing = run([editor, "--list-extensions", "--show-versions"], timeout=300)
+    for line in listing.output.splitlines():
+        line = line.strip()
+        if line.startswith(f"{EXTENSION_ID}@"):
+            return line.split("@", 1)[1]
+    return None
+
+
+def stage_extensions(claude: str | None, dry_run: bool) -> list[str]:
     heading("editor extensions")
+
+    # The extension ships in lockstep with the CLI - same version numbers - so
+    # the CLI's own version is the target, pinned. Asking the gallery for
+    # "latest" is not safe: measured 2026-09-19, Cursor's gallery answered
+    # 2.1.277 while it also held 2.1.278, and `--force` installed it over the
+    # 2.1.278 already there - a silent downgrade reported as a clean run.
+    target = tool_version(claude) if claude else None
+    spec = f"{EXTENSION_ID}@{target}" if target else EXTENSION_ID
     problems, found_any = [], False
 
     for command in EDITOR_COMMANDS:
         binary = resolve(command)
         if binary is None:
             continue
-        listing = run([binary, "--list-extensions", "--show-versions"], timeout=300)
-        matches = [
-            line.strip()
-            for line in listing.output.splitlines()
-            if line.strip().startswith(f"{EXTENSION_ID}@")
-        ]
-        if not matches:
+        before = installed_extension(binary)
+        if before is None:
             continue
 
         found_any = True
-        log(f"* {command}: {matches[0]}")
+        log(f"* {command}: {EXTENSION_ID}@{before}")
+        if target and version_key(before) >= version_key(target):
+            # Never force-install over an extension already at or past the CLI.
+            log(f"  = {command}: {before} (CLI is {target})")
+            continue
         if dry_run:
-            log(f"DRY RUN: {command} --install-extension {EXTENSION_ID} --force")
+            log(f"DRY RUN: {command} --install-extension {spec} --force")
             continue
 
-        result = run(
-            [binary, "--install-extension", EXTENSION_ID, "--force"], timeout=900
-        )
-        log(f"  {summarize(result.output)}")
+        result = run([binary, "--install-extension", spec, "--force"], timeout=900)
+
+        # Re-read rather than trust the installer's "successfully installed".
+        after = installed_extension(binary)
+        if after is None:
+            log(f"  ! {command}: {before} -> {UNREADABLE}")
+            problems.append(f"{command} extension missing after install")
+        elif version_key(after) < version_key(before):
+            log(f"  ! {command}: {before} -> {after} (downgraded)")
+            problems.append(f"{command} extension downgraded {before} -> {after}")
+        else:
+            marker = "=" if after == before else ">"
+            log(f"  {marker} {command}: {before} -> {after}")
         if not result.ok:
+            log(f"    ! {summarize_failure(result.output)}")
             problems.append(f"{command} extension exit {result.code}")
 
     if not found_any:
@@ -738,7 +771,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             claude, args.dry_run, args.prune_orphans, args.yes
         )
     if "ext" not in skip:
-        problems += stage_extensions(args.dry_run)
+        problems += stage_extensions(claude, args.dry_run)
     if "agents" not in skip:
         problems += stage_agents(args.dry_run, args.fix_agents)
 

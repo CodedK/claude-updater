@@ -124,7 +124,7 @@ plugin updates resolve against current catalogs, and the health check runs
 | `tools` | each CLI in `SELF_UPDATING_TOOLS` runs its own updater (`agy update`) |
 | `market` | `claude plugin marketplace update` |
 | `plugins` | `claude plugin update <name> --scope <scope>` for every installed plugin |
-| `ext` | `--install-extension anthropic.claude-code --force` in each detected editor |
+| `ext` | `--install-extension anthropic.claude-code@<CLI version> --force` in each detected editor still behind the CLI |
 | `agents` | runs `agy-codex-doctor.ps1` if the machine has one; blockers fail the run |
 
 Nothing is hardcoded to one machine:
@@ -139,6 +139,11 @@ Nothing is hardcoded to one machine:
   are skipped rather than counted as failures.
 - **Editors are discovered by probing PATH** for `code`, `code-insiders`, `cursor`
   and `windsurf`. Missing ones are skipped silently.
+- **The extension is pinned to the CLI's version**, never to a gallery's "latest".
+  The two ship with identical version numbers, and an editor gallery can lag: a
+  forced "latest" install once replaced 2.1.278 with 2.1.277. An extension already
+  at or past the CLI is left alone, and the version is re-read after every install,
+  so a downgrade is reported as a problem rather than as success.
 - **Self-updating CLIs are only updated if already on PATH**, and their version is
   read from the binary itself, never from a package manager's record — see the
   note on `agy` below for why that distinction matters.

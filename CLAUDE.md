@@ -135,8 +135,35 @@ not protect the many other places CLI output is echoed verbatim.
   a silent skip. Before, `main()` dropped `market` and `plugins` from the stage
   list and still printed "all stages completed cleanly" — the tool's headline
   result was a lie on any machine with a native install.
-- A native install is **not updated by any of the four stages**; it updates
+- A native install is **not updated by any stage**; it updates
   itself via `claude update`. Only an npm-installed CLI moves in the `npm` stage.
+- **"Not on PATH" can be the parent process, not the machine.** Measured
+  2026-09-19: a session running inside Cursor inherited *only* the Machine PATH,
+  missing every User PATH entry (`~/.local/bin`, `%APPDATA%\npm`, `agy\bin`,
+  `WindowsApps`), while a process launched through Explorer had all of them.
+  From that editor, `agy` and `codex` looked uninstalled and `stage_tools`
+  silently skipped agy. Before concluding a tool is missing, compare with a
+  process Explorer starts. The fix is restarting the editor, not editing PATH.
+
+### Editor extension: pin to the CLI's version, never force "latest"
+
+- **The extension ships in lockstep with the CLI**, with identical version numbers.
+  Verified 2026-09-19: Open VSX lists `2.1.272`...`2.1.278`, matching the CLI
+  changelog headings one for one.
+- **An editor's gallery can serve an older "latest" than it holds.** Measured on
+  2026-09-19. Cursor's gallery (`marketplace.cursorapi.com`) answered
+  `--install-extension anthropic.claude-code --force` with **2.1.277** over an
+  installed **2.1.278**, a downgrade. The old stage printed the installer's
+  cheerful line and the run said `all stages completed cleanly`. A pinned
+  `anthropic.claude-code@2.1.278` from the same gallery succeeded seconds later.
+- So `stage_extensions` installs `@<claude --version>`. It skips any editor
+  already at or past that version. It re-reads the version after installing, and
+  a drop is reported as `! ... (downgraded)` and recorded as a problem. Without a
+  CLI it falls back to unpinned "latest", still verified.
+- The day a CLI release beats the gallery, the pinned install fails with exit 1
+  and is recorded. That is honest - the extension *is* behind the CLI - and the
+  next run clears it. Do not "fix" it by falling back to unpinned `--force`:
+  that is exactly the path that downgraded.
 
 ### Scope, and where plugins actually live
 
@@ -260,6 +287,14 @@ Verified 2026-09-18 on Windows 10.
   **Do not add `-ExecutionPolicy Bypass`.** It would make the symptom disappear by
   overriding a security control the operator configured, which is not a bulk
   updater's decision. Report honestly and let them choose.
+- **`codex login status` is not a health check.** Measured 2026-09-19 on codex
+  0.155.1. It printed `Logged in using ChatGPT` while every real call failed:
+  401, `Your access token could not be refreshed`. It only checks that
+  `~/.codex/auth.json` exists, and that file's `last_refresh` was four months
+  old. Only a real round-trip proves codex works:
+  `codex exec --skip-git-repo-check --sandbox read-only "Reply with exactly CODEX_OK"`.
+  The fix is a fresh `codex login`, and only the operator can finish it in a
+  browser. The same goes for agy: `agy -p "..." --print-timeout 3m`.
 - **The stage does not detect elevation, on purpose.** The doctor already warns
   when it runs elevated — where its sandbox verdict is a false negative — and that
   warning is echoed. One implementation of that rule, not two.
